@@ -68,7 +68,7 @@ let dummy_loc =
 let rec erase_locs { Locs.desc; _ } =
   erase_locs_desc desc
 and erase_locs_desc = function
-  | Locs.String s -> No_locs.String s
+  | Locs.String (ty, s) -> No_locs.String (ty, s)
   | Locs.Escaped s -> No_locs.Escaped s
   | Locs.Section s -> No_locs.Section (erase_locs_section s)
   | Locs.Unescaped s -> No_locs.Unescaped s
@@ -78,16 +78,15 @@ and erase_locs_desc = function
   | Locs.Comment s -> No_locs.Comment s
 and erase_locs_section { Locs.name; Locs.contents } =
   { No_locs.name; No_locs.contents = erase_locs contents }
-and erase_locs_partial { Locs.indent; Locs.name; Locs.contents } =
-  { No_locs.indent;
-    No_locs.name;
+and erase_locs_partial { Locs.name; Locs.contents } =
+  { No_locs.name;
     No_locs.contents = lazy (option_map (Lazy.force contents) erase_locs) }
 
 let rec add_dummy_locs t =
   { Locs.loc = dummy_loc;
     Locs.desc = add_dummy_locs_desc t }
 and add_dummy_locs_desc = function
-  | No_locs.String s -> Locs.String s
+  | No_locs.String (ty, s) -> Locs.String (ty, s)
   | No_locs.Escaped s -> Locs.Escaped s
   | No_locs.Section s -> Locs.Section (add_dummy_locs_section s)
   | No_locs.Unescaped s -> Locs.Unescaped s
@@ -98,9 +97,8 @@ and add_dummy_locs_desc = function
   | No_locs.Comment s -> Locs.Comment s
 and add_dummy_locs_section { No_locs.name; No_locs.contents } =
   { Locs.name; Locs.contents = add_dummy_locs contents }
-and add_dummy_locs_partial { No_locs.indent; No_locs.name; No_locs.contents } =
-  { Locs.indent;
-    Locs.name;
+and add_dummy_locs_partial { No_locs.name; No_locs.contents } =
+  { Locs.name;
     Locs.contents = lazy (option_map (Lazy.force contents) add_dummy_locs) }
 
 (* Printing: defined on the ast without locations. *)
@@ -108,7 +106,7 @@ and add_dummy_locs_partial { No_locs.indent; No_locs.name; No_locs.contents } =
 let rec pp fmt =
   let open No_locs in
   function
-  | String s ->
+  | String (_ty, s) ->
     Format.pp_print_string fmt s
 
   | Escaped s ->
@@ -164,9 +162,9 @@ let parse_lx (lexbuf: Lexing.lexbuf) : Locs.t =
     raise (Template_parse_error { loc; kind })
   in
   try
-    MenhirLib.Convert.Simplified.traditional2revised
-      Mustache_parser.mustache
-      Mustache_lexer.(handle_standalone mustache lexbuf)
+    Mustache_parser.mustache
+      Mustache_lexer.mustache
+      lexbuf
   with
   | Mustache_lexer.Error msg ->
     raise_err lexbuf (Lexing msg)
@@ -383,6 +381,147 @@ module Render = struct
 
   open Locs
 
+  (* Per-line whitespace handling.
+
+     The Mustache specification is careful with its treatment of
+     whitespace. In particular, tags that do not themselves expand to
+     visible content are defined as "standalone", with the requirement
+     that if one or several standalone tags "stand alone" in a line
+     (there is nothing else but whitespace), the whitespace of this
+     line should be ommitted.
+
+     For example, this means that:
+
+       {{#foo}}
+       I can access {{var}} inside the section.
+       {{/foo}
+
+     takes, once rendered, only 1 line instead of 3: the newlines
+     after {{#foo}} and {{/foo}} are part of the "standalone
+     whitespace", so they are not included in the output. This is what
+     the user expects.
+
+     We implement this logic by adding rendering the template into
+     a "line buffer", which stores elements to be printed until the
+     line is full, and at this point decides whether whitespace should
+     be checked or not.
+
+     The line buffer is also used to keep track of the line
+     indentation, which is useful for the rendering of {{>partial}}
+     tags: the spec mandates that when a partial is used standalone,
+     then its indentation on the line should be added to all the lines
+     of its rendered content.
+  *)
+  module Line : sig
+    type state
+
+    type output_token =
+      | Raw of string_type * string
+      | Data of string
+      | Partial of (state -> unit)
+
+    val init : Buffer.t -> global_indentation:int -> state
+
+    val print : state -> output_token -> unit
+
+    val standalone_tag : state -> unit
+
+    val standalone_block : state -> (unit -> unit) -> unit
+
+    val end_of_input : state -> unit
+  end = struct
+    type output_token =
+      | Raw of string_type * string
+      | Data of string
+      | Partial of (state -> unit)
+
+    and state = {
+      buf: Buffer.t; (* output buffer *)
+      global_indentation: int; (* global indentation of the current printing context *)
+      mutable indentation: int; (* number of spaces at the beginning of the line *)
+      mutable standalone: bool; (* have we seen any standalone token? *)
+      mutable visible: bool; (* have we seen any visible token? *)
+      mutable rev_buffer: output_token list; (* delayed printing to flush *)
+    }
+
+    let init buf ~global_indentation = {
+      buf;
+      global_indentation;
+      indentation = 0;
+      standalone = false;
+      visible = false;
+      rev_buffer = [];
+    }
+
+    let reset ls =
+      ls.indentation <- 0;
+      ls.standalone <- false;
+      ls.visible <- false;
+      ls.rev_buffer <- [];
+      ()
+
+    let flush line =
+      let standalone_line =
+        line.standalone && not line.visible in
+      let tokens =
+        let rec rev acc = function
+          | [] -> acc
+          | Raw ((Blank | Newline), _) :: rest when standalone_line -> rev acc rest
+          | token :: rest -> rev (token :: acc) rest
+        in
+        rev [] line.rev_buffer
+      in
+      let output_token = function
+        | Raw (_, s) -> Buffer.add_string line.buf s
+        | Data s ->
+          Buffer.add_string line.buf s
+        | Partial output_partial ->
+          let partial_indentation =
+            if standalone_line
+            then line.global_indentation + line.indentation
+            else line.global_indentation
+          in
+          let partial_line =
+            (* The partial template comes from a different source file,
+               so it uses a different line state (with the same output buffer). *)
+            init line.buf ~global_indentation:partial_indentation
+          in
+          output_partial partial_line
+      in
+      begin
+        if not (standalone_line || tokens = []) then
+          Buffer.add_string line.buf (String.make line.global_indentation ' ');
+        List.iter output_token tokens;
+        reset line;
+      end
+
+    let standalone_tag line =
+      line.standalone <- true
+
+    let standalone_block line output_fun =
+      standalone_tag line;
+      output_fun ();
+      standalone_tag line
+
+    let print (line : state) token =
+      line.rev_buffer <- token :: line.rev_buffer;
+      begin match token with
+      | Raw (Visible, _) | Data _ ->
+        line.visible <- true;
+      | Partial _ ->
+        line.standalone <- true;
+      | Raw (Blank, s) ->
+        let beginning_of_line = not (line.standalone || line.visible) in
+        if beginning_of_line then
+          line.indentation <- line.indentation + String.length s;
+      | Raw (Newline, _) ->
+        flush line;
+      end
+
+    let end_of_input line =
+      flush line
+  end
+
   (* Render a template whose partials have already been expanded.
 
      Note: the reason we expand partials once before rendering,
@@ -397,75 +536,60 @@ module Render = struct
         ?(strict = true)
         (buf : Buffer.t) (m : Locs.t) (js : Json.t)
     =
-    let print_indent indent =
-      for _ = 0 to indent - 1 do
-        Buffer.add_char buf ' '
-      done
-    in
-
-    let beginning_of_line = ref true in
-
-    let align indent =
-      if !beginning_of_line then (
-        print_indent indent;
-        beginning_of_line := false
-      )
-    in
-
-    let print_indented_string indent s =
-      let lines = String.split_on_char '\n' s in
-      align indent; Buffer.add_string buf (List.hd lines);
-      List.iter (fun line ->
-        Buffer.add_char buf '\n';
-        beginning_of_line := true;
-        if line <> "" then (
-          align indent;
-          Buffer.add_string buf line;
-        )
-      ) (List.tl lines)
-    in
-
-    let rec render indent m (ctxs : Contexts.t) =
+    let rec render (line : Line.state) m (ctxs : Contexts.t) =
       let loc = m.loc in
       match m.desc with
 
-      | String s ->
-        print_indented_string indent s
+      | String (string_type, s) ->
+        Line.print line (Raw (string_type, s))
 
       | Escaped name ->
-        align indent;
-        Buffer.add_string buf (escape_html (Lookup.str ~strict ~loc ~key:name ctxs))
+        let data = escape_html (Lookup.str ~strict ~loc ~key:name ctxs) in
+        Line.print line (Data data)
 
       | Unescaped name ->
-        align indent;
-        Buffer.add_string buf (Lookup.str ~strict ~loc ~key:name ctxs)
+        let data = Lookup.str ~strict ~loc ~key:name ctxs in
+        Line.print line (Data data)
 
       | Inverted_section s ->
-        if Lookup.inverted ctxs ~loc ~key:s.name
-        then render indent s.contents ctxs
+        Line.standalone_block line (fun () ->
+          if Lookup.inverted ctxs ~loc ~key:s.name
+          then render line s.contents ctxs;
+        )
 
       | Section s ->
-        let enter ctx = render indent s.contents (Contexts.add ctxs ctx) in
+        let enter ctx =
+          Line.standalone_block line (fun () ->
+            render line s.contents (Contexts.add ctxs ctx)
+          )
+        in
         begin match Lookup.section ~strict ctxs ~loc ~key:s.name with
         | `Bool false -> ()
         | `A elems    -> List.iter enter elems
         | elem        -> enter elem
-        end
+        end;
 
-      | Partial { indent = partial_indent; name; contents } ->
+      | Partial { name; contents } ->
+        Line.standalone_tag line;
         begin match (Lazy.force contents, strict) with
-        | Some p, _ -> render (indent + partial_indent) p ctxs
+        | Some p, _ ->
+          Line.print line (Partial (fun partial_line ->
+            render partial_line p ctxs;
+            Line.end_of_input partial_line))
         | None, false -> ()
         | None, true ->
           raise_err loc (Missing_partial { name })
-        end
+        end;
 
-      | Comment _c -> ()
+      | Comment _c ->
+        Line.standalone_tag line;
 
       | Concat templates ->
-        List.iter (fun x -> render indent x ctxs) templates
-
-    in render 0 m (Contexts.start (Json.value js))
+        List.iter (fun x -> render line x ctxs) templates;
+    in
+    let line = Line.init buf ~global_indentation:0 in
+    render line m (Contexts.start (Json.value js));
+    Line.end_of_input line
 end
 
 (* Packing up everything in two modules of similar signature:
@@ -488,7 +612,7 @@ module Without_locations = struct
   let rec fold ~string ~section ~escaped ~unescaped ~partial ~comment ~concat t =
     let go = fold ~string ~section ~escaped ~unescaped ~partial ~comment ~concat in
     match t with
-    | String s -> string s
+    | String (ty, s) -> string ty s
     | Escaped s -> escaped s
     | Unescaped s -> unescaped s
     | Comment s -> comment s
@@ -498,35 +622,36 @@ module Without_locations = struct
       section ~inverted:true name (go contents)
     | Concat ms ->
       concat (List.map ms ~f:go)
-    | Partial p -> partial p.indent p.name p.contents
+    | Partial p -> partial p.name p.contents
 
   module Infix = struct
     let (^) y x = Concat [x; y]
   end
 
-  let raw s = String s
+  let string ty s = String (ty, s)
+  let concat t = Concat t
+  let raw s = concat (Mustache_lexer.process_string string s)
   let escaped s = Escaped s
   let unescaped s = Unescaped s
   let section n c = Section { name = n ; contents = c }
   let inverted_section n c = Inverted_section { name = n ; contents = c }
-  let partial ?(indent = 0) n c = Partial { indent ; name = n ; contents = c }
-  let concat t = Concat t
+  let partial n c = Partial { name = n ; contents = c }
   let comment s = Comment s
 
   let rec expand_partials (partials : name -> t option) : t -> t =
     let section ~inverted =
       if inverted then inverted_section else section
     in
-    let partial indent name contents =
+    let partial name contents =
       let contents' = lazy (
         match Lazy.force contents with
         | None -> option_map (partials name) (expand_partials partials)
         | Some t_opt -> Some t_opt
       )
       in
-      partial ~indent name contents'
+      partial name contents'
     in
-    fold ~string:raw ~section ~escaped ~unescaped ~partial ~comment ~concat
+    fold ~string ~section ~escaped ~unescaped ~partial ~comment ~concat
 
 
   let render_buf ?strict ?(partials = fun _ -> None) buf (m : t) (js : Json.t) =
@@ -563,7 +688,7 @@ module With_locations = struct
     let go = fold ~string ~section ~escaped ~unescaped ~partial ~comment ~concat in
     let { desc; loc } = t in
     match desc with
-    | String s -> string ~loc s
+    | String (ty, s) -> string ~loc ty s
     | Escaped s -> escaped ~loc s
     | Unescaped s -> unescaped ~loc s
     | Comment s -> comment ~loc s
@@ -573,13 +698,15 @@ module With_locations = struct
       section ~loc ~inverted:true name (go contents)
     | Concat ms ->
       concat ~loc (List.map ms ~f:go)
-    | Partial p -> partial ~loc p.indent p.name p.contents
+    | Partial p -> partial ~loc p.name p.contents
 
   module Infix = struct
     let (^) t1 t2 = { desc = Concat [t1; t2]; loc = dummy_loc }
   end
 
-  let raw ~loc s = { desc = String s; loc }
+  let string ~loc ty s = { desc = String (ty, s); loc }
+  let concat ~loc t = { desc = Concat t; loc }
+  let raw ~loc s = concat ~loc (Mustache_lexer.process_string (string ~loc) s)
   let escaped ~loc s = { desc = Escaped s; loc }
   let unescaped ~loc s = { desc = Unescaped s; loc }
   let section ~loc n c =
@@ -588,26 +715,25 @@ module With_locations = struct
   let inverted_section ~loc n c =
     { desc = Inverted_section { name = n; contents = c };
       loc }
-  let partial ~loc ?(indent = 0) n c =
-    { desc = Partial { indent; name = n; contents = c };
+  let partial ~loc n c =
+    { desc = Partial { name = n; contents = c };
       loc }
-  let concat ~loc t = { desc = Concat t; loc }
   let comment ~loc s = { desc = Comment s; loc }
 
   let rec expand_partials (partials : name -> t option) : t -> t =
     let section ~loc ~inverted =
       if inverted then inverted_section ~loc else section ~loc
     in
-    let partial ~loc indent name contents =
+    let partial ~loc name contents =
       let contents' = lazy (
         match Lazy.force contents with
         | None -> option_map (partials name) (expand_partials partials)
         | Some t_opt -> Some t_opt
       )
       in
-      partial ~loc ~indent name contents'
+      partial ~loc name contents'
     in
-    fold ~string:raw ~section ~escaped ~unescaped ~partial ~comment ~concat
+    fold ~string ~section ~escaped ~unescaped ~partial ~comment ~concat
 
   let render_buf ?strict ?(partials = fun _ -> None) buf (m : t) (js : Json.t) =
     let m = expand_partials partials m in

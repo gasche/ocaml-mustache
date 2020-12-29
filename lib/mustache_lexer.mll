@@ -22,6 +22,7 @@
 {
   open Lexing
   open Mustache_parser
+  open Mustache_types
 
   exception Error of string
 
@@ -47,6 +48,52 @@
   let check_mustaches ~expected ~lexed =
     if expected <> lexed then
       raise (Error (Printf.sprintf "'%s' expected" expected))
+
+  let is_blank s =
+    let blank = ref true in
+    let i = ref 0 in
+    let len = String.length s in
+    while !blank && !i < len do
+      begin match s.[!i] with
+      | ' ' | '\t' -> ()
+      | _ -> blank := false
+      end;
+      incr i
+    done;
+    !blank
+
+  let string_type s =
+    if s = "\n" || s = "\r\n" then Newline
+    else if is_blank s then Blank
+    else Visible
+
+  (* take a user-provided string, which may contain newlines,
+     and split it into raw chunks following the structure
+     expected by the rendering pass *)
+  let process_string (f : string_type -> string -> 'a) s : 'a list =
+    let len = String.length s in
+    let chunk_type chunk = if is_blank chunk then Blank else Visible in
+    let rec process acc start_pos =
+      if start_pos >= len then List.rev acc
+      else match String.index_from_opt s start_pos '\n' with
+        | None ->
+          let chunk = String.sub s start_pos (len - start_pos) in
+          process (f (chunk_type chunk) chunk :: acc) len
+        | Some newline_pos ->
+          let newline_start =
+            if newline_pos > 0 && s.[newline_pos - 1] = '\r'
+            then newline_pos - 1
+            else newline_pos
+          in
+          let newline = String.sub s newline_start (newline_pos - newline_start + 1) in
+          if newline_start = start_pos then
+            process (f Newline newline :: acc) (newline_pos + 1)
+          else
+            let chunk = String.sub s start_pos (newline_start - start_pos) in
+            process (f Newline newline :: f (chunk_type chunk) chunk :: acc) (newline_pos + 1)
+    in
+    process [] 0
+
 }
 
 let blank = [' ' '\t']*
@@ -90,9 +137,9 @@ and end_on expected = parse
 
 and comment acc = parse
   | "}}"        { String.concat "" (List.rev acc) }
-  | raw newline { new_line lexbuf; comment ((lexeme lexbuf) :: acc) lexbuf }
-  | raw         { comment ((lexeme lexbuf) :: acc) lexbuf }
   | ['{' '}']   { comment ((lexeme lexbuf) :: acc) lexbuf }
+  | raw         { comment ((lexeme lexbuf) :: acc) lexbuf }
+  | newline     { new_line lexbuf; comment ((lexeme lexbuf) :: acc) lexbuf }
   | eof         { raise (Error "non-terminated comment") }
 
 and mustache = parse
@@ -102,86 +149,11 @@ and mustache = parse
   | "{{#"        { OPEN_SECTION (lex_tag lexbuf space ident (end_on "}}") |> split_ident) }
   | "{{^"        { OPEN_INVERTED_SECTION (lex_tag lexbuf space ident (end_on "}}") |> split_ident) }
   | "{{/"        { CLOSE_SECTION (lex_tag lexbuf space ident (end_on "}}") |> split_ident) }
-  | "{{>"        { PARTIAL (0, lex_tag lexbuf space partial_name (end_on "}}")) }
+  | "{{>"        { PARTIAL (lex_tag lexbuf space partial_name (end_on "}}")) }
   | "{{!"        { COMMENT (tok_arg lexbuf (comment [])) }
-  | raw newline  { new_line lexbuf; RAW (lexeme lexbuf) }
-  | raw          { RAW (lexeme lexbuf) }
-  | ['{' '}']    { RAW (lexeme lexbuf) }
+  | ['{' '}']    { RAW (Visible, lexeme lexbuf) }
+  | raw          { let raw = lexeme lexbuf in
+                   let ty = if is_blank raw then Blank else Visible in
+                   RAW (ty, raw) }
+  | newline      { new_line lexbuf; RAW (Newline, lexeme lexbuf) }
   | eof          { EOF }
-
-{
-   let handle_standalone lexer lexbuf =
-     let ends_with_newline s =
-       String.length s > 0 &&
-       s.[String.length s - 1] = '\n'
-     in
-     let get_loc () = lexbuf.Lexing.lex_curr_p in
-     let get_tok () =
-       let loc_start = get_loc () in
-       let tok = lexer lexbuf in
-       let loc_end = get_loc () in
-       (tok, loc_start, loc_end)
-     in
-     let slurp_line () =
-       let rec loop acc =
-         let tok = get_tok () in
-         match tok with
-         | EOF, _, _ -> tok :: acc
-         | RAW s, _, _ when ends_with_newline s -> tok :: acc
-         | _ -> loop (tok :: acc)
-       in
-       List.rev (loop [])
-     in
-     let is_blank s =
-       let ret = ref true in
-       for i = 0 to String.length s - 1 do
-         if not (List.mem s.[i] [' '; '\t'; '\r'; '\n']) then
-           ret := false
-       done;
-       !ret
-     in
-     let skip_blanks l =
-       let rec loop skipped = function
-         | (RAW s, _, _) :: toks when is_blank s ->
-           loop (skipped + String.length s) toks
-         | toks -> (skipped, toks)
-       in
-       loop 0 l
-     in
-     let is_standalone toks =
-       let (skipped, toks) = skip_blanks toks in
-       match toks with
-       | ((OPEN_SECTION _
-          | OPEN_INVERTED_SECTION _
-          | CLOSE_SECTION _
-          | PARTIAL _
-          | COMMENT _), _, _) as tok :: toks' ->
-         let (_, toks_rest) = skip_blanks toks' in
-         begin match toks_rest with
-         | [] | [(EOF, _, _)] ->
-           let tok =
-             match tok with
-             | (PARTIAL (_, p), loc1, loc2) ->
-               (PARTIAL (skipped, p), loc1, loc2)
-             | _ -> tok
-           in
-           Some (tok, toks_rest)
-         | _ -> None
-         end
-       | _ -> None
-     in
-
-     let buffer = ref [] in
-     fun () ->
-       match !buffer with
-       | tok :: toks ->
-         buffer := toks; tok
-       | [] ->
-         let toks = slurp_line () in
-         match is_standalone toks with
-         | Some (tok_standalone, toks_rest) ->
-           buffer := toks_rest;
-           tok_standalone
-         | None ->
-           buffer := List.tl toks; List.hd toks
-}

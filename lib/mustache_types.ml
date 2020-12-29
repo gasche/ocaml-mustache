@@ -37,11 +37,13 @@ let pp_dotted_name fmt = function
 let string_of_dotted_name n =
   Format.asprintf "%a" pp_dotted_name n
 
+type string_type = Newline | Blank | Visible
+
 module Locs = struct
   [@@@warning "-30"]
 
   type desc =
-    | String of string
+    | String of string_type * string
     | Escaped of dotted_name
     | Section of section
     | Unescaped of dotted_name
@@ -53,8 +55,7 @@ module Locs = struct
     { name: dotted_name;
       contents: t }
   and partial =
-    { indent: int;
-      name: name;
+    { name: name;
       contents: t option Lazy.t }
   and t =
     { loc : loc;
@@ -65,7 +66,7 @@ module No_locs = struct
   [@@@warning "-30"]
 
   type t =
-    | String of string
+    | String of string_type * string
     | Escaped of dotted_name
     | Section of section
     | Unescaped of dotted_name
@@ -77,8 +78,7 @@ module No_locs = struct
     { name: dotted_name;
       contents: t }
   and partial =
-    { indent: int;
-      name: name;
+    { name: name;
       contents: t option Lazy.t }
 end
 

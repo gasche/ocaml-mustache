@@ -111,7 +111,7 @@ Mismatch between section-start and section-end:
   $ echo "{{#bar}} {{#foo}} {{.}} {{/bar}} {{/foo}}" > $PROBLEM
   $ mustache foo.json $PROBLEM
   Template parse error:
-  File "wrong-nesting.mustache", lines 1-2, characters 41-0:
+  File "wrong-nesting.mustache", line 1, characters 32-33:
   Section mismatch: {{#foo}} is closed by {{/bar}}.
   [3]
 

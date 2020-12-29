@@ -24,7 +24,7 @@
   open Mustache_types
   open Mustache_types.Locs
 
-  let parse_section start_name end_name contents =
+  let parse_section start_name end_name contents : section =
     if start_name <> end_name then
       raise (Mismatched_section { start_name; end_name });
     { contents; name = start_name }
@@ -37,15 +37,12 @@
 %}
 
 %token EOF
-%token <string list> ESCAPE
-%token <string list> UNESCAPE
-%token <string list> OPEN_INVERTED_SECTION
-%token <string list> OPEN_SECTION
-%token <string list> CLOSE_SECTION
-%token <int * string> PARTIAL
+%token <string list> ESCAPE UNESCAPE
+%token <string list> OPEN_SECTION OPEN_INVERTED_SECTION CLOSE_SECTION
+%token <string> PARTIAL
 %token <string> COMMENT
 
-%token <string> RAW
+%token <Mustache_types.string_type * string> RAW
 
 %start mustache
 %type <Mustache_types.Locs.t> mustache
@@ -71,18 +68,18 @@ mustache_element:
   | elt = ESCAPE { with_loc $sloc (Escaped elt) }
   | elt = PARTIAL {
       with_loc $sloc
-        (Partial { indent = fst elt;
-                   name = snd elt;
+        (Partial { name = elt;
                    contents = lazy None })
     }
   | s = COMMENT { with_loc $sloc (Comment s) }
   | sec = section { sec }
-  | s = RAW { with_loc $sloc (String s) }
+  | r = RAW { let (string_type, s) = r in
+              with_loc $sloc (String (string_type, s)) }
 
 mustache_expr:
   | elts = list(mustache_element) {
     match elts with
-    | [] -> with_loc $sloc (String "")
+    | [] -> with_loc $sloc (String (Blank, ""))
     | [x] -> x
     | xs -> with_loc $sloc (Concat xs)
   }

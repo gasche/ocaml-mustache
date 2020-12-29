@@ -13,7 +13,6 @@ reference.json and reference.mustache work well together, there is no error.
   
   The variable "name" has value "Some Name".
   
-  
   Last line.
 
 

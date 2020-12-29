@@ -19,8 +19,10 @@ end
 type name = string
 type dotted_name = string list
 
+type string_type = Newline | Blank | Visible
+
 type t =
-  | String of string
+  | String of string_type * string
   | Escaped of dotted_name
   | Section of section
   | Unescaped of dotted_name
@@ -32,8 +34,7 @@ and section =
   { name: dotted_name;
     contents: t }
 and partial =
-  { indent: int;
-    name: name;
+  { name: name;
     contents: t option Lazy.t }
 
 type loc =
@@ -129,11 +130,12 @@ val render :
     @param unescaped Applied to ["name"] for occurrences of [{{{name}}}].
     @param partial Applied to ["box"] for occurrences of [{{> box}}].
     @param comment Applied to ["comment"] for occurrences of [{{! comment}}]. *)
-val fold : string: (string -> 'a) ->
+val fold :
+  string: (string_type -> string -> 'a) ->
   section: (inverted:bool -> dotted_name -> 'a -> 'a) ->
   escaped: (dotted_name -> 'a) ->
   unescaped: (dotted_name -> 'a) ->
-  partial: (int -> name -> t option Lazy.t -> 'a) ->
+  partial: (name -> t option Lazy.t -> 'a) ->
   comment: (string -> 'a) ->
   concat:('a list -> 'a) ->
   t -> 'a
@@ -169,7 +171,7 @@ val inverted_section : dotted_name -> t -> t
 val section : dotted_name -> t -> t
 
 (** [{{> box}}] *)
-val partial : ?indent:int -> name -> t option Lazy.t -> t
+val partial : name -> t option Lazy.t -> t
 
 (** [{{! this is a comment}}] *)
 val comment : string -> t
@@ -185,7 +187,7 @@ module With_locations : sig
   type nonrec loc = loc = { loc_start: Lexing.position; loc_end: Lexing.position }
 
   type desc =
-    | String of string
+    | String of string_type * string
     | Escaped of dotted_name
     | Section of section
     | Unescaped of dotted_name
@@ -197,8 +199,7 @@ module With_locations : sig
     { name: dotted_name;
       contents: t }
   and partial =
-    { indent: int;
-      name: name;
+    { name: name;
       contents: t option Lazy.t }
   and t =
     { loc : loc;
@@ -266,11 +267,12 @@ module With_locations : sig
       @param unescaped Applied to ["name"] for occurrences of [{{{name}}}].
       @param partial Applied to ["box"] for occurrences of [{{> box}}].
       @param comment Applied to ["comment"] for occurrences of [{{! comment}}]. *)
-  val fold : string: (loc:loc -> string -> 'a) ->
+  val fold :
+    string: (loc:loc -> string_type -> string -> 'a) ->
     section: (loc:loc -> inverted:bool -> dotted_name -> 'a -> 'a) ->
     escaped: (loc:loc -> dotted_name -> 'a) ->
     unescaped: (loc:loc -> dotted_name -> 'a) ->
-    partial: (loc:loc -> int -> name -> t option Lazy.t -> 'a) ->
+    partial: (loc:loc -> name -> t option Lazy.t -> 'a) ->
     comment: (loc:loc -> string -> 'a) ->
     concat:(loc:loc -> 'a list -> 'a) ->
     t -> 'a
@@ -304,7 +306,7 @@ module With_locations : sig
   val section : loc:loc -> dotted_name -> t -> t
 
   (** [{{> box}}] *)
-  val partial : loc:loc -> ?indent:int -> name -> t option Lazy.t -> t
+  val partial : loc:loc -> name -> t option Lazy.t -> t
 
   (** [{{! this is a comment}}] *)
   val comment : loc:loc -> string -> t

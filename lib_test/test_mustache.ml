@@ -122,11 +122,11 @@ let tests_with_locs = With_locations.[
    , concat ~loc:(mkloc (1, 0, 0, 4, 24, 31)) [
       raw ~loc:(mkloc (1, 0, 0, 1, 0, 1)) " ";
       section ~loc:(mkloc (1, 0, 1, 4, 24, 31)) ["a"] (
-        concat ~loc:(mkloc (2, 8, 12, 4, 24, 24)) [
+        concat ~loc:(mkloc (2, 8, 12, 4, 24, 25)) [
           raw ~loc:(mkloc (2, 8, 12, 2, 8, 13)) " ";
           escaped ~loc:(mkloc (2, 8, 13, 3, 17, 23)) ["x"];
           raw ~loc:(mkloc (3, 17, 23, 4, 24, 24)) "\n";
-          (* raw ~loc:(mkloc (4, 24, 24, 4, 24, 25)) " " *)
+          raw ~loc:(mkloc (4, 24, 24, 4, 24, 25)) " "
         ]
       )
     ]
@@ -141,7 +141,11 @@ let tests_with_locs = With_locations.[
    , [ ( `A [], "" )]);
 
   ("  {{!x}}   "
-   , comment ~loc:(mkloc (1, 0, 2, 1, 0, 8)) "x"
+   , concat ~loc:(mkloc (1, 0, 0, 1, 0, 11)) [
+      raw "  " ~loc:(mkloc (1, 0, 0, 1, 0, 2));
+      comment ~loc:(mkloc (1, 0, 2, 1, 0, 8)) "x";
+      raw "   " ~loc:(mkloc (1, 0, 8, 1, 0, 11));
+    ]
    , [ (`A [], "" )]);
 ]
 
@@ -154,7 +158,6 @@ let () =
     fun _ -> assert_equal ~printer a b in
 
   "Mustache test suite" >:::
-
     (List.mapi
        (fun i (input, expected_parsing, rendering_tests) ->
         let template =
@@ -167,7 +170,7 @@ let () =
         in
         (Printf.sprintf "%d - erase_locs/add_dummy_locs roundtrip" i
          >:: assert_equal (roundtrip template) template)
-        :: (Printf.sprintf "%d - parsing" i
+        :: (Printf.sprintf "%d - parsing (%S)" i input
          >:: assert_equal expected_parsing template)
         :: List.mapi (fun j (data, expected) ->
           let rendered =
@@ -193,7 +196,7 @@ let () =
                   i (Printexc.to_string exn)
               )
           in
-          (Printf.sprintf "%d with locations - parsing" i
+          (Printf.sprintf "%d with locations - parsing (%S)" i input
            >:: assert_equal expected_parsing template)
           :: List.mapi (fun j (data, expected) ->
             let rendered =
